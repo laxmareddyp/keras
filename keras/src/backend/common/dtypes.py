@@ -285,9 +285,9 @@ def _lattice_result_type(*args):
 def result_type(*dtypes):
     """Returns the type from applying the Keras type promotion rules.
 
-    In general, each argument is first parsed by `backend.standardize_dtype`,
-    and the resulting dtype is determined by the least upper bound of the type
-    promotion lattice.
+    In general, each argument is first parsed by `standardize_dtype` and the
+    resulting dtype is determined by the least upper bound of the type promotion
+    lattice.
 
     Note: This function attempts to match the result of `jnp.result_type`.
 
@@ -326,3 +326,24 @@ def result_type(*dtypes):
     return _lattice_result_type(
         *(config.floatx() if arg is None else arg for arg in dtypes),
     )
+
+
+def promote_to_float_dtype(dtype):
+    """Returns the dtype to use for an operation that needs a float input.
+
+    Integer and bool dtypes are promoted to `config.floatx()`. Float dtypes are
+    returned unchanged, including `float64`, `bfloat16` and the `float8` types.
+
+    This only computes the dtype. Callers do the cast themselves, since `cast`
+    is backend specific.
+
+    Args:
+        dtype: The dtype of the input.
+
+    Returns:
+        The float dtype to cast the input to.
+    """
+    dtype = standardize_dtype(dtype)
+    if "int" in dtype or dtype == "bool":
+        return config.floatx()
+    return dtype

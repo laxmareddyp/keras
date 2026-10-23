@@ -14,6 +14,7 @@ from keras.src.backend import config
 from keras.src.backend.common import KerasVariable
 from keras.src.backend.common import global_state
 from keras.src.backend.common import standardize_dtype
+from keras.src.backend.common.backend_utils import standardize_argnums
 from keras.src.backend.common.keras_tensor import KerasTensor
 from keras.src.backend.common.name_scope import name_scope as base_name_scope
 from keras.src.backend.common.stateless_scope import StatelessScope
@@ -22,13 +23,8 @@ from keras.src.backend.common.stateless_scope import in_stateless_scope
 from keras.src.backend.common.symbolic_scope import SymbolicScope
 from keras.src.backend.jax import distribution_lib
 
-SUPPORTS_SPARSE_TENSORS = True
-SUPPORTS_RAGGED_TENSORS = False
-SUPPORTS_COMPLEX_DTYPES = True
-IS_THREAD_SAFE = True
 
-
-class JaxVariable(KerasVariable):
+class Variable(KerasVariable):
     def _initialize_layout(self):
         # We can't import the keras/distribution/distribution_lib
         # due to circular dependency.
@@ -93,7 +89,6 @@ class JaxVariable(KerasVariable):
         return self.value
 
 
-Variable = JaxVariable
 if config.is_nnx_enabled():
     from flax import nnx
 
@@ -129,7 +124,9 @@ if config.is_nnx_enabled():
         if trace_state is not None:
             object.__setattr__(trace_state, "_jax_trace", _enclosing_traces[0])
 
-    class NnxVariable(JaxVariable, nnx.Variable):
+    JaxVariable = Variable
+
+    class Variable(JaxVariable, nnx.Variable):
         def __init__(
             self,
             initializer,
@@ -303,8 +300,6 @@ if config.is_nnx_enabled():
                 )
             return self._maybe_autocast(current_value)
 
-    Variable = NnxVariable
-
     def _flatten_nnx_variable(variable):
         children = (_get_raw_value(variable),)
         # We copy __dict__ to avoid side effects
@@ -324,7 +319,7 @@ if config.is_nnx_enabled():
         raw_value = children[0]
 
         # Create uninitialized instance
-        variable = NnxVariable.__new__(NnxVariable)
+        variable = Variable.__new__(Variable)
 
         # Restore state
         variable._var_metadata = var_metadata
@@ -337,7 +332,7 @@ if config.is_nnx_enabled():
 
     try:
         jax.tree_util.register_pytree_node(
-            NnxVariable,
+            Variable,
             _flatten_nnx_variable,
             _unflatten_nnx_variable,
         )
@@ -356,10 +351,16 @@ if config.is_nnx_enabled():
 
         object.__setattr__(self, name, value)
 
-    NnxVariable.__setattr__ = __setattr__
+    Variable.__setattr__ = __setattr__
 
 
 def should_shard_at_init(init_layout, shape):
+    # Keras itself creates `NamedSharding` instances that have a `mesh`
+    # attribute. However, KerasRS uses layouts and formats, which do not
+    # directly have a mesh attribute. Apply the sharding in this case.
+    if not isinstance(init_layout, jax.sharding.NamedSharding):
+        return True
+
     size_threshold = 250 * 1024 * 1024
     # We multiply by the mesh size here to take into account the worst case
     # scenario of the array being first duplicated in the memory of one device
@@ -394,7 +395,8 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
         else:
             return x
 
-    if not is_tensor(x) and standardize_dtype(dtype) == "bfloat16":
+    # The branch must run only for an explicit bfloat16 request:
+    if not is_tensor(x) and dtype is not None and dtype == "bfloat16":
         # Can't create bfloat16 arrays on the fly (e.g. from a h5 Dataset).
         # Instead we convert "as is" (to stored dtype) and cast.
         return jnp.asarray(x).astype(dtype)
@@ -738,3 +740,19 @@ def device_scope(device_name):
     else:
         jax_device = device_name
     return jax.default_device(jax_device)
+
+
+def grad(f, argnums=0):
+    def scalar_f(*args, **kwargs):
+        # A gradient tape sums a non scalar output, so do the same here.
+        return jnp.sum(f(*args, **kwargs))
+
+    def grad_fn(*args, **kwargs):
+        positions = standardize_argnums(argnums, len(args))
+        args = list(args)
+        for i in positions:
+            args[i] = tree.map_structure(convert_to_tensor, args[i])
+        jax_argnums = positions[0] if isinstance(argnums, int) else positions
+        return jax.grad(scalar_f, argnums=jax_argnums)(*args, **kwargs)
+
+    return grad_fn

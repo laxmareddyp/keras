@@ -14,6 +14,7 @@ from keras.src.backend.common import KerasVariable
 from keras.src.backend.common import global_state
 from keras.src.backend.common import standardize_dtype
 from keras.src.backend.common.backend_utils import slice_along_axis
+from keras.src.backend.common.backend_utils import standardize_argnums
 from keras.src.backend.common.dtypes import result_type
 from keras.src.backend.common.keras_tensor import KerasTensor
 from keras.src.backend.common.stateless_scope import StatelessScope
@@ -22,29 +23,32 @@ from keras.src.backend.common.stateless_scope import in_stateless_scope
 from keras.src.backend.common.symbolic_scope import SymbolicScope
 from keras.src.backend.config import floatx
 
-SUPPORTS_SPARSE_TENSORS = False
-SUPPORTS_RAGGED_TENSORS = False
-SUPPORTS_COMPLEX_DTYPES = True
-IS_THREAD_SAFE = True
-_GLOBAL_DTENSOR_PROMOTION_MODE = None
-_DTENSOR_PROMOTION_ACTIVE = False
+
+# The promotion mode lives only on the torch dispatch stack, which is per
+# thread like the Keras distribution. Keras keeps no reference to the mode, so
+# no reset of Keras state can orphan a mode that is still on the stack.
+def _get_dtensor_promotion_mode():
+    stack = torch.utils._python_dispatch._get_current_dispatch_mode_stack()
+    for mode in stack:
+        if isinstance(mode, KerasDTensorPromotionMode):
+            return mode
+    return None
 
 
 def activate_dtensor_promotion():
-    global _GLOBAL_DTENSOR_PROMOTION_MODE, _DTENSOR_PROMOTION_ACTIVE
-    if _GLOBAL_DTENSOR_PROMOTION_MODE is None:
-        _GLOBAL_DTENSOR_PROMOTION_MODE = KerasDTensorPromotionMode()
-    if not _DTENSOR_PROMOTION_ACTIVE:
-        _GLOBAL_DTENSOR_PROMOTION_MODE.__enter__()
-        _DTENSOR_PROMOTION_ACTIVE = True
+    if _get_dtensor_promotion_mode() is None:
+        KerasDTensorPromotionMode().__enter__()
 
 
 def deactivate_dtensor_promotion():
-    global _GLOBAL_DTENSOR_PROMOTION_MODE, _DTENSOR_PROMOTION_ACTIVE
-    if _DTENSOR_PROMOTION_ACTIVE:
-        _GLOBAL_DTENSOR_PROMOTION_MODE.__exit__(None, None, None)
-        _DTENSOR_PROMOTION_ACTIVE = False
-    _GLOBAL_DTENSOR_PROMOTION_MODE = None
+    mode = _get_dtensor_promotion_mode()
+    # `__exit__` pops the top of the stack, so only exit the mode when it is
+    # on top. Otherwise it would pop a mode that was entered after it.
+    if (
+        mode is not None
+        and torch.utils._python_dispatch._get_current_dispatch_mode() is mode
+    ):
+        mode.__exit__(None, None, None)
 
 
 # Some operators such as 'aten::_foreach_mul_.Scalar'
@@ -245,7 +249,9 @@ class Variable(KerasVariable):
             ).to(get_device())
 
     def _direct_assign(self, value):
-        if isinstance(self.value.data, DTensor):
+        # Use `self._value`, not `self.value`: inside an `AutocastScope`,
+        # `self.value` is a cast copy and writes to it would be lost.
+        if isinstance(self._value.data, DTensor):
             from keras.src.backend.torch import distribution_lib
             from keras.src.distribution.distribution_lib import TensorLayout
 
@@ -254,10 +260,12 @@ class Variable(KerasVariable):
                 layout = layout.backend_layout
             if value.device.type != layout.device_mesh.device_type:
                 value = value.to(layout.device_mesh.device_type)
-            value = distribution_lib.distribute_tensor(value, layout)
+            # Assignment is not differentiable, and torch only distributes
+            # leaf tensors.
+            value = distribution_lib.distribute_tensor(value.detach(), layout)
 
         with torch.no_grad():
-            self.value.copy_(value)
+            self._value.copy_(value)
 
     def _convert_to_tensor(self, value, dtype=None):
         return convert_to_tensor(value, dtype=dtype)
@@ -279,6 +287,16 @@ class Variable(KerasVariable):
         if dtype:
             return value.astype(dtype)
         return value
+
+    def __repr__(self):
+        if isinstance(getattr(self, "_value", None), DTensor):
+            # Gathering a sharded value is a collective, and a repr can run
+            # on a single process (a log line, a debugger, an error message).
+            return (
+                f"<Variable path={self.path}, shape={self.shape}, "
+                f"dtype={self.dtype}>"
+            )
+        return super().__repr__()
 
     @property
     def value(self):
@@ -405,10 +423,12 @@ def convert_to_numpy(x):
         if isinstance(x, Variable):
             x = x.value
         if is_tensor(x):
-            if isinstance(x, DTensor):
-                x = x.to_local()
             if x.requires_grad:
                 x = x.detach()
+            if isinstance(x, DTensor):
+                # Gather the global value. This is a collective when `x` is
+                # sharded across processes, so every process must convert it.
+                x = x.full_tensor()
             # Tensor has to be moved to CPU before converting to numpy.
             if x.device != torch.device("cpu"):
                 x = x.cpu()
@@ -978,11 +998,11 @@ class CustomGradientFunction(torch.autograd.Function):
         """
         ctx.forward_fn = forward_fn
         ctx.save_for_backward(*args)
-        try:
-            output, ctx.grad_fn = forward_fn(*args, **kwargs)
-        except:
-            output = forward_fn(*args, **kwargs)
-            ctx.grad_fn = lambda *args, **kwargs: torch.full((), float("nan"))
+        result = forward_fn(*args, **kwargs)
+        if isinstance(result, (list, tuple)) and len(result) == 2:
+            output, ctx.grad_fn = result
+        else:
+            output, ctx.grad_fn = result, None
         return output
 
     @staticmethod
@@ -1000,4 +1020,38 @@ class CustomGradientFunction(torch.autograd.Function):
         grads = grad_fn(*args, upstream=grad_output)
         if not isinstance(grads, tuple):
             grads = (grads,)
-        return (None,) + grads
+        # Keras ops compute the gradients on `get_device()`, but autograd
+        # needs each gradient on the device of its input.
+        grads = list(grads)
+        for i, (grad, x) in enumerate(zip(grads, args)):
+            if isinstance(grad, torch.Tensor) and x is not None:
+                grads[i] = grad.to(x.device)
+        return (None,) + tuple(grads)
+
+
+def grad(f, argnums=0):
+    def grad_fn(*args, **kwargs):
+        positions = standardize_argnums(argnums, len(args))
+        args = list(args)
+
+        def track(x):
+            return convert_to_tensor(x).detach().requires_grad_(True)
+
+        for i in positions:
+            args[i] = tree.map_structure(track, args[i])
+        inputs = [args[i] for i in positions]
+        leaves = tree.flatten(inputs)
+        with torch.enable_grad():
+            # A gradient tape sums a non scalar output, so do the same here.
+            output = torch.sum(f(*args, **kwargs))
+        leaf_grads = torch.autograd.grad(output, leaves, allow_unused=True)
+        leaf_grads = [
+            torch.zeros_like(x) if g is None else g
+            for g, x in zip(leaf_grads, leaves)
+        ]
+        grads = tree.pack_sequence_as(inputs, leaf_grads)
+        if isinstance(argnums, int):
+            return grads[0]
+        return tuple(grads)
+
+    return grad_fn

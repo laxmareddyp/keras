@@ -16,6 +16,7 @@ from keras.src.ops.core import convert_to_tensor as convert_to_tensor
 from keras.src.ops.core import custom_gradient as custom_gradient
 from keras.src.ops.core import dtype as dtype
 from keras.src.ops.core import fori_loop as fori_loop
+from keras.src.ops.core import grad as grad
 from keras.src.ops.core import is_tensor as is_tensor
 from keras.src.ops.core import map as map
 from keras.src.ops.core import saturate_cast as saturate_cast
@@ -137,8 +138,6 @@ from keras.src.ops.numpy import absolute as absolute
 from keras.src.ops.numpy import add as add
 from keras.src.ops.numpy import all as all
 from keras.src.ops.numpy import allclose as allclose
-from keras.src.ops.numpy import amax as amax
-from keras.src.ops.numpy import amin as amin
 from keras.src.ops.numpy import angle as angle
 from keras.src.ops.numpy import any as any
 from keras.src.ops.numpy import append as append
@@ -262,11 +261,13 @@ from keras.src.ops.numpy import logical_or as logical_or
 from keras.src.ops.numpy import logical_xor as logical_xor
 from keras.src.ops.numpy import logspace as logspace
 from keras.src.ops.numpy import matmul as matmul
+from keras.src.ops.numpy import max as amax
 from keras.src.ops.numpy import max as max
 from keras.src.ops.numpy import maximum as maximum
 from keras.src.ops.numpy import mean as mean
 from keras.src.ops.numpy import median as median
 from keras.src.ops.numpy import meshgrid as meshgrid
+from keras.src.ops.numpy import min as amin
 from keras.src.ops.numpy import min as min
 from keras.src.ops.numpy import minimum as minimum
 from keras.src.ops.numpy import mod as mod
